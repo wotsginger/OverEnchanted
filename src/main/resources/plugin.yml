@@ -1,0 +1,7 @@
+name: OverEnchanted
+version: '1.0-SNAPSHOT'
+main: club.sitmc.overEnchanted.OverEnchanted
+api-version: '1.21'
+description: 突破附魔等级限制及铁砧经验上限
+author: 上海应用技术大学Minecraft社
+depend: [packetevents]
