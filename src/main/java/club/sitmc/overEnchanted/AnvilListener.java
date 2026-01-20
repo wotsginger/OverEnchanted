@@ -10,6 +10,7 @@ import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.PrepareAnvilEvent;
 import org.bukkit.inventory.AnvilInventory;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.EnchantmentStorageMeta;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.inventory.view.AnvilView;
@@ -21,7 +22,10 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class AnvilListener implements Listener {
 
     private static final int MAX_ENCHANT_LEVEL = 10;
+
+    /** 正在“伪创造态”的玩家 */
     public static final Map<UUID, Integer> preparing = new ConcurrentHashMap<>();
+
 
     @EventHandler
     public void onPrepare(PrepareAnvilEvent event) {
@@ -30,10 +34,15 @@ public final class AnvilListener implements Listener {
         Player player = (Player) view.getPlayer();
         AnvilInventory inv = view.getTopInventory();
 
-        ItemStack left = inv.getItem(0);
+        ItemStack left  = inv.getItem(0);
         ItemStack right = inv.getItem(1);
 
         if (left == null || right == null) {
+            remove(player);
+            return;
+        }
+
+        if (!canMerge(left, right)) {
             remove(player);
             return;
         }
@@ -43,11 +52,12 @@ public final class AnvilListener implements Listener {
         ItemStack result = left.clone();
 
         Map<Enchantment, Integer> incoming = getIncomingEnchants(right);
-
         boolean hasEnchantMerge = !incoming.isEmpty();
-        float cost = calculateInitialCost(left);
+
+        int cost = calculateInitialCost(left);
         int applied = 0;
 
+        /* ❷ 附魔合并 */
         for (Map.Entry<Enchantment, Integer> entry : incoming.entrySet()) {
             Enchantment enchant = entry.getKey();
 
@@ -62,31 +72,33 @@ public final class AnvilListener implements Listener {
             applyEnchant(result, enchant, finalLevel);
             applied++;
 
-            // 经验成本：低等级线性，高等级指数
-            if (finalLevel <= 4) {
-                cost += finalLevel * 2.0f;
-            } else {
-                cost += Math.pow(finalLevel, 2.2) * 3.5f;
-            }
+            cost += enchantCost(finalLevel);
+        }
+
+        if (hasEnchantMerge) {
+            mergeDurability(result, right);
         }
 
         String rename = view.getRenameText();
         boolean renaming = rename != null && !rename.isEmpty();
 
-        if (applied == 0 && !renaming) return;
+        if (applied == 0 && !renaming) {
+            remove(player);
+            return;
+        }
 
         if (renaming) {
             applyRename(result, rename);
-            cost += 5; // 改名成本
+            cost += 1;
         }
 
         event.setResult(result);
 
-        int finalCost = Math.max(1, (int) cost);
-        view.setRepairCost(finalCost);
+        cost = Math.max(1, cost);
+        view.setRepairCost(cost);
 
-        if (finalCost >= 40) {
-            preparing.put(player.getUniqueId(), finalCost);
+        if (event.getResult() != null && cost >= 40) {
+            preparing.put(player.getUniqueId(), cost);
             PacketEvents.getAPI().getPlayerManager()
                     .sendPacket(player, PacketListener.create(player, true));
         } else {
@@ -103,10 +115,19 @@ public final class AnvilListener implements Listener {
     }
 
     private void remove(Player player) {
-        if (preparing.remove(player.getUniqueId()) != null) {
-            PacketEvents.getAPI().getPlayerManager()
-                    .sendPacket(player, PacketListener.createExact(player));
-        }
+        if (!preparing.containsKey(player.getUniqueId())) return;
+
+        PacketEvents.getAPI().getPlayerManager()
+                .sendPacket(player, PacketListener.createExact(player));
+
+        preparing.remove(player.getUniqueId());
+    }
+
+    private boolean canMerge(ItemStack left, ItemStack right) {
+        if (right.getType() == Material.ENCHANTED_BOOK) return true;
+        if (left.getType() == Material.ENCHANTED_BOOK
+                && right.getType() == Material.ENCHANTED_BOOK) return true;
+        return left.getType() == right.getType();
     }
 
     private Map<Enchantment, Integer> getIncomingEnchants(ItemStack item) {
@@ -138,7 +159,6 @@ public final class AnvilListener implements Listener {
         }
 
         if (leftLevel == 0 && hasConflict(base, enchant)) return false;
-
         return true;
     }
 
@@ -172,21 +192,47 @@ public final class AnvilListener implements Listener {
         }
     }
 
-    private float calculateInitialCost(ItemStack left) {
-        float cost = 10f; // 基础成本
+    private int calculateInitialCost(ItemStack left) {
+        int cost = 0;
         Map<Enchantment, Integer> enchants =
                 left.getType() == Material.ENCHANTED_BOOK
                         ? ((EnchantmentStorageMeta) left.getItemMeta()).getStoredEnchants()
                         : left.getEnchantments();
 
         for (int lvl : enchants.values()) {
-            if (lvl <= 4) {
-                cost += lvl * 2.0f; // 低等级线性
-            } else {
-                cost += Math.pow(lvl, 2.2) * 3.5f; // 高等级指数
-            }
+            cost += enchantCost(lvl);
         }
-
         return cost;
+    }
+
+    private int enchantCost(int level) {
+        if (level <= 5) {
+            return switch (level) {
+                case 1 -> 1;
+                case 2 -> 3;
+                case 3 -> 6;
+                case 4 -> 10;
+                case 5 -> 15;
+                default -> 0;
+            };
+        }
+        double t = (level - 6) / 4.0;
+        return (int) Math.round(50 + 100 * Math.pow(t, 1.4));
+    }
+
+    private void mergeDurability(ItemStack base, ItemStack sacrifice) {
+        if (!(base.getItemMeta() instanceof Damageable m1)) return;
+        if (!(sacrifice.getItemMeta() instanceof Damageable m2)) return;
+
+        int max = base.getType().getMaxDurability();
+
+        int leftRemain  = max - m1.getDamage();
+        int rightRemain = max - m2.getDamage();
+
+        int bonus = (int) (max * 0.12);
+        int finalRemain = Math.min(max, leftRemain + rightRemain + bonus);
+
+        m1.setDamage(max - finalRemain);
+        base.setItemMeta((ItemMeta) m1);
     }
 }
